@@ -325,9 +325,9 @@
                     }
 
                     seg.frg = 0;
-                    kcp.snd_queue.push_back(seg);
                     len -= extend;
-                    kcp.snd_queue.remove(kcp.snd_queue.len() - 1);
+                    kcp.snd_queue.pop_back();
+                    kcp.snd_queue.push_back(seg);
                     sent = extend;
                 }
 
