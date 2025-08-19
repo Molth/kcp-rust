@@ -151,7 +151,6 @@ pub fn ikcp_create(conv: u32) -> IKCPCB {
 // user/upper level recv: returns size, returns below zero for EAGAIN
 pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) -> i32 {
     let ispeek = len < 0;
-    let peeksize: i32;
     let mut recover = false;
 
     if kcp.rcv_queue.is_empty() {
@@ -160,7 +159,7 @@ pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
     len = len.abs();
 
-    peeksize = ikcp_peeksize(kcp);
+    let peeksize = ikcp_peeksize(kcp);
 
     match peeksize {
         x if x < 0 => return -2,
@@ -175,15 +174,13 @@ pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
     // merge fragment
     len = 0;
     while let Some(seg) = kcp.rcv_queue.front() {
-        let fragment: i32;
-
         if let Some(data) = buffer {
             memcpy(data, &seg.data, seg.data.len());
             buffer = Some(&mut data[..seg.data.len()]);
         }
 
         len += seg.data.len() as i32;
-        fragment = seg.frg as i32;
+        let fragment = seg.frg as i32;
 
         if !ispeek {
             kcp.rcv_queue.pop_front();
@@ -263,7 +260,7 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
                 memcpy(&mut seg.data, &old.data, old.data.len());
 
                 if let Some(data) = buffer {
-                    memcpy(&mut seg.data[old.data.len()..], &data, extend as usize);
+                    memcpy(&mut seg.data[old.data.len()..], data, extend as usize);
                     buffer = Some(&mut data[extend as usize..]);
                 }
 
@@ -327,7 +324,6 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
 // parse ack
 pub(crate) fn ikcp_update_ack(kcp: &mut IKCPCB, rtt: i32) {
-    let rto;
     if kcp.rx_srtt == 0 {
         kcp.rx_srtt = rtt;
         kcp.rx_rttval = rtt / 2;
@@ -339,7 +335,7 @@ pub(crate) fn ikcp_update_ack(kcp: &mut IKCPCB, rtt: i32) {
         kcp.rx_srtt = kcp.rx_srtt.max(1);
     }
 
-    rto = ((kcp.rx_srtt as i64) + (kcp.interval.max((4 * kcp.rx_rttval) as u32) as i64)) as i32;
+    let rto = ((kcp.rx_srtt as i64) + (kcp.interval.max((4 * kcp.rx_rttval) as u32) as i64)) as i32;
     kcp.rx_rto = (rto as u32).clamp(kcp.rx_minrto as u32, IKCP_RTO_MAX) as i32;
 }
 
@@ -534,7 +530,7 @@ pub fn ikcp_input(kcp: &mut IKCPCB, mut data: &[u8], mut size: i64) -> i32 {
                         seg.una = una;
 
                         if len > 0 {
-                            memcpy(&mut seg.data, &data, len as usize);
+                            memcpy(&mut seg.data, data, len as usize);
                         }
 
                         ikcp_parse_data(kcp, seg);
@@ -613,10 +609,7 @@ where
 
     let mut size: i32;
 
-    let resent: u32;
     let mut cwnd: u32;
-
-    let rtomin: u32;
 
     let mut change = 0;
     let mut lost = false;
@@ -727,12 +720,12 @@ where
     }
 
     // calculate resent
-    resent = match kcp.fastresend > 0 {
+    let resent = match kcp.fastresend > 0 {
         true => kcp.fastresend as u32,
         false => 0xffffffff,
     };
 
-    rtomin = match kcp.nodelay == 0 {
+    let rtomin = match kcp.nodelay == 0 {
         true => (kcp.rx_rto >> 3) as u32,
         false => 0,
     };
@@ -774,13 +767,12 @@ where
         }
 
         if needsend {
-            let need;
             segment.ts = current;
             segment.wnd = seg.wnd;
             segment.una = kcp.rcv_nxt;
 
             size = memoffset(ptr, position) as i32;
-            need = (IKCP_OVERHEAD as i32) + (segment.data.len() as i32);
+            let need = (IKCP_OVERHEAD as i32) + (segment.data.len() as i32);
 
             if (size + need) > (kcp.mtu as i32) {
                 ikcp_output(kcp, size, buffer, user, output);
@@ -789,9 +781,9 @@ where
                 segment = &mut kcp.snd_buf[i];
             }
 
-            ptr = ikcp_encode_seg(ptr, &segment);
+            ptr = ikcp_encode_seg(ptr, segment);
 
-            if segment.data.len() > 0 {
+            if !segment.data.is_empty() {
                 memcpy(ptr, &segment.data, segment.data.len());
                 ptr = &mut ptr[segment.data.len()..];
             }
@@ -853,7 +845,7 @@ pub fn ikcp_update<T, F>(
 
     slap = ikcp_timediff(kcp.current, kcp.ts_flush);
 
-    if slap >= 10000 || slap < -10000 {
+    if !(-10000..10000).contains(&slap) {
         kcp.ts_flush = kcp.current;
         slap = 0;
     }
@@ -878,9 +870,7 @@ pub fn ikcp_update<T, F>(
 // or optimize ikcp_update when handling massive kcp connections)
 pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
     let mut ts_flush = kcp.ts_flush;
-    let tm_flush;
     let mut tm_packet = i32::MAX;
-    let minimal;
 
     if !kcp.updated {
         return current;
@@ -892,7 +882,7 @@ pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
         _ => {}
     }
 
-    tm_flush = ikcp_timediff(ts_flush, current);
+    let tm_flush = ikcp_timediff(ts_flush, current);
 
     for seg in &kcp.snd_buf {
         match ikcp_timediff(seg.resendts, current) {
@@ -902,7 +892,7 @@ pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
         }
     }
 
-    minimal = (tm_packet.min(tm_flush) as u32).min(kcp.interval);
+    let minimal = (tm_packet.min(tm_flush) as u32).min(kcp.interval);
 
     current + minimal
 }
