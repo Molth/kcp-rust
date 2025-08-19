@@ -1,2 +1,1 @@
-# kcp-rust
-
+This project is a pure safe-rust translation of [KCP](https://github.com/skywind3000/kcp).
