@@ -887,7 +887,7 @@ pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
     }
 
     match ikcp_timediff(current, ts_flush) {
-        diff if diff >= 10000 || diff < -10000 => ts_flush = current,
+        diff if !(-10000..10000).contains(&diff) => ts_flush = current,
         diff if diff >= 0 => return current,
         _ => {}
     }
