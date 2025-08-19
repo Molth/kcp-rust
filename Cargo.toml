@@ -1,13 +1,13 @@
 [package]
 name = "kcp-rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 description = "High performance pure safe-rust kcp implementation."
 license = "MIT"
 authors = ["Molth Nevin"]
 repository = "https://github.com/Molth/kcp-rust"
-documentation = "https://github.com/Molth/kcp-rust"
+documentation = "https://github.com/skywind3000/kcp"
 readme = "README.md"
 keywords = ["kcp", "networking", "reliable", "udp", "protocol"]
 categories = ["network-programming"]

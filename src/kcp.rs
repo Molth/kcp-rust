@@ -27,7 +27,7 @@ pub(crate) fn memcpy(dst: &mut [u8], src: &[u8], len: usize) {
     dst[..len].copy_from_slice(&src[..len]);
 }
 
-pub(crate) fn memoffset(dst: &mut [u8], src: usize) -> usize {
+pub(crate) fn memoffset(dst: &[u8], src: usize) -> usize {
     (dst.as_ptr() as usize) - src
 }
 
@@ -67,7 +67,7 @@ pub fn ikcp_decode32u<'a>(p: &'a [u8], l: &mut u32) -> &'a [u8] {
     &p[4..]
 }
 
-pub fn ikcp_timediff(later: u32, earlier: u32) -> i32 {
+pub const fn ikcp_timediff(later: u32, earlier: u32) -> i32 {
     later.wrapping_sub(earlier) as i32
 }
 
@@ -107,7 +107,7 @@ pub(crate) fn ikcp_output<T, F>(
 }
 
 // create a new kcp control object, 'conv' must equal in two endpoint
-pub fn ikcp_create(conv: u32) -> IKCPCB {
+pub const fn ikcp_create(conv: u32) -> IKCPCB {
     IKCPCB {
         conv,
         snd_una: 0,
@@ -151,6 +151,7 @@ pub fn ikcp_create(conv: u32) -> IKCPCB {
 // user/upper level recv: returns size, returns below zero for EAGAIN
 pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) -> i32 {
     let ispeek = len < 0;
+    let peeksize: i32;
     let mut recover = false;
 
     if kcp.rcv_queue.is_empty() {
@@ -159,7 +160,7 @@ pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
     len = len.abs();
 
-    let peeksize = ikcp_peeksize(kcp);
+    peeksize = ikcp_peeksize(kcp);
 
     match peeksize {
         x if x < 0 => return -2,
@@ -174,13 +175,15 @@ pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
     // merge fragment
     len = 0;
     while let Some(seg) = kcp.rcv_queue.front() {
+        let fragment: i32;
+
         if let Some(data) = buffer {
             memcpy(data, &seg.data, seg.data.len());
             buffer = Some(&mut data[..seg.data.len()]);
         }
 
         len += seg.data.len() as i32;
-        let fragment = seg.frg as i32;
+        fragment = seg.frg as i32;
 
         if !ispeek {
             kcp.rcv_queue.pop_front();
@@ -324,6 +327,7 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
 // parse ack
 pub(crate) fn ikcp_update_ack(kcp: &mut IKCPCB, rtt: i32) {
+    let rto: i32;
     if kcp.rx_srtt == 0 {
         kcp.rx_srtt = rtt;
         kcp.rx_rttval = rtt / 2;
@@ -335,7 +339,7 @@ pub(crate) fn ikcp_update_ack(kcp: &mut IKCPCB, rtt: i32) {
         kcp.rx_srtt = kcp.rx_srtt.max(1);
     }
 
-    let rto = ((kcp.rx_srtt as i64) + (kcp.interval.max((4 * kcp.rx_rttval) as u32) as i64)) as i32;
+    rto = ((kcp.rx_srtt as i64) + (kcp.interval.max((4 * kcp.rx_rttval) as u32) as i64)) as i32;
     kcp.rx_rto = (rto as u32).clamp(kcp.rx_minrto as u32, IKCP_RTO_MAX) as i32;
 }
 
@@ -609,7 +613,10 @@ where
 
     let mut size: i32;
 
+    let resent: u32;
     let mut cwnd: u32;
+
+    let rtomin: u32;
 
     let mut change = 0;
     let mut lost = false;
@@ -720,12 +727,12 @@ where
     }
 
     // calculate resent
-    let resent = match kcp.fastresend > 0 {
+    resent = match kcp.fastresend > 0 {
         true => kcp.fastresend as u32,
-        false => 0xffffffff,
+        false => u32::MAX,
     };
 
-    let rtomin = match kcp.nodelay == 0 {
+    rtomin = match kcp.nodelay == 0 {
         true => (kcp.rx_rto >> 3) as u32,
         false => 0,
     };
@@ -767,12 +774,13 @@ where
         }
 
         if needsend {
+            let need: i32;
             segment.ts = current;
             segment.wnd = seg.wnd;
             segment.una = kcp.rcv_nxt;
 
             size = memoffset(ptr, position) as i32;
-            let need = (IKCP_OVERHEAD as i32) + (segment.data.len() as i32);
+            need = (IKCP_OVERHEAD as i32) + (segment.data.len() as i32);
 
             if (size + need) > (kcp.mtu as i32) {
                 ikcp_output(kcp, size, buffer, user, output);
@@ -870,7 +878,9 @@ pub fn ikcp_update<T, F>(
 // or optimize ikcp_update when handling massive kcp connections)
 pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
     let mut ts_flush = kcp.ts_flush;
+    let tm_flush: i32;
     let mut tm_packet = i32::MAX;
+    let minimal: u32;
 
     if !kcp.updated {
         return current;
@@ -882,7 +892,7 @@ pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
         _ => {}
     }
 
-    let tm_flush = ikcp_timediff(ts_flush, current);
+    tm_flush = ikcp_timediff(ts_flush, current);
 
     for seg in &kcp.snd_buf {
         match ikcp_timediff(seg.resendts, current) {
@@ -892,7 +902,7 @@ pub fn ikcp_check(kcp: &IKCPCB, current: u32) -> u32 {
         }
     }
 
-    let minimal = (tm_packet.min(tm_flush) as u32).min(kcp.interval);
+    minimal = (tm_packet.min(tm_flush) as u32).min(kcp.interval);
 
     current + minimal
 }
@@ -956,16 +966,20 @@ pub fn ikcp_waitsnd(kcp: &IKCPCB) -> i32 {
 }
 
 // read conv
-pub fn ikcp_getconv(kcp: &IKCPCB) -> u32 {
+pub const fn ikcp_getconv(kcp: &IKCPCB) -> u32 {
     kcp.conv
 }
 
+pub fn ikcp_dead_link(kcp: &mut IKCPCB, dead_link: u32) {
+    kcp.dead_link = dead_link;
+}
+
 pub fn ikcp_fastlimit(kcp: &mut IKCPCB, fastlimit: i32) {
-    kcp.fastlimit = fastlimit
+    kcp.fastlimit = fastlimit;
 }
 
 pub fn ikcp_stream(kcp: &mut IKCPCB, stream: bool) {
-    kcp.stream = stream
+    kcp.stream = stream;
 }
 
 pub struct IKCPSEG {
@@ -984,40 +998,40 @@ pub struct IKCPSEG {
 }
 
 impl IKCPSEG {
-    pub fn conv(&self) -> u32 {
+    pub const fn conv(&self) -> u32 {
         self.conv
     }
-    pub fn cmd(&self) -> u32 {
+    pub const fn cmd(&self) -> u32 {
         self.cmd
     }
-    pub fn frg(&self) -> u32 {
+    pub const fn frg(&self) -> u32 {
         self.frg
     }
-    pub fn wnd(&self) -> u32 {
+    pub const fn wnd(&self) -> u32 {
         self.wnd
     }
-    pub fn ts(&self) -> u32 {
+    pub const fn ts(&self) -> u32 {
         self.ts
     }
-    pub fn sn(&self) -> u32 {
+    pub const fn sn(&self) -> u32 {
         self.sn
     }
-    pub fn una(&self) -> u32 {
+    pub const fn una(&self) -> u32 {
         self.una
     }
-    pub fn resendts(&self) -> u32 {
+    pub const fn resendts(&self) -> u32 {
         self.resendts
     }
-    pub fn rto(&self) -> u32 {
+    pub const fn rto(&self) -> u32 {
         self.rto
     }
-    pub fn fastack(&self) -> u32 {
+    pub const fn fastack(&self) -> u32 {
         self.fastack
     }
-    pub fn xmit(&self) -> u32 {
+    pub const fn xmit(&self) -> u32 {
         self.xmit
     }
-    pub fn data(&self) -> &Vec<u8> {
+    pub const fn data(&self) -> &Vec<u8> {
         &self.data
     }
 }
@@ -1072,122 +1086,122 @@ pub struct IKCPCB {
 }
 
 impl IKCPCB {
-    pub fn conv(&self) -> u32 {
+    pub const fn conv(&self) -> u32 {
         self.conv
     }
-    pub fn mtu(&self) -> u32 {
+    pub const fn mtu(&self) -> u32 {
         self.mtu
     }
-    pub fn mss(&self) -> u32 {
+    pub const fn mss(&self) -> u32 {
         self.mss
     }
-    pub fn state(&self) -> bool {
+    pub const fn state(&self) -> bool {
         self.state
     }
 
-    pub fn snd_una(&self) -> u32 {
+    pub const fn snd_una(&self) -> u32 {
         self.snd_una
     }
-    pub fn snd_nxt(&self) -> u32 {
+    pub const fn snd_nxt(&self) -> u32 {
         self.snd_nxt
     }
-    pub fn rcv_nxt(&self) -> u32 {
+    pub const fn rcv_nxt(&self) -> u32 {
         self.rcv_nxt
     }
 
-    pub fn ssthresh(&self) -> u32 {
+    pub const fn ssthresh(&self) -> u32 {
         self.ssthresh
     }
 
-    pub fn rx_rttval(&self) -> i32 {
+    pub const fn rx_rttval(&self) -> i32 {
         self.rx_rttval
     }
-    pub fn rx_srtt(&self) -> i32 {
+    pub const fn rx_srtt(&self) -> i32 {
         self.rx_srtt
     }
-    pub fn rx_rto(&self) -> i32 {
+    pub const fn rx_rto(&self) -> i32 {
         self.rx_rto
     }
-    pub fn rx_minrto(&self) -> i32 {
+    pub const fn rx_minrto(&self) -> i32 {
         self.rx_minrto
     }
 
-    pub fn snd_wnd(&self) -> u32 {
+    pub const fn snd_wnd(&self) -> u32 {
         self.snd_wnd
     }
-    pub fn rcv_wnd(&self) -> u32 {
+    pub const fn rcv_wnd(&self) -> u32 {
         self.rcv_wnd
     }
-    pub fn rmt_wnd(&self) -> u32 {
+    pub const fn rmt_wnd(&self) -> u32 {
         self.rmt_wnd
     }
-    pub fn cwnd(&self) -> u32 {
+    pub const fn cwnd(&self) -> u32 {
         self.cwnd
     }
-    pub fn probe(&self) -> u32 {
+    pub const fn probe(&self) -> u32 {
         self.probe
     }
 
-    pub fn current(&self) -> u32 {
+    pub const fn current(&self) -> u32 {
         self.current
     }
-    pub fn interval(&self) -> u32 {
+    pub const fn interval(&self) -> u32 {
         self.interval
     }
-    pub fn ts_flush(&self) -> u32 {
+    pub const fn ts_flush(&self) -> u32 {
         self.ts_flush
     }
-    pub fn xmit(&self) -> u32 {
+    pub const fn xmit(&self) -> u32 {
         self.xmit
     }
 
-    pub fn nodelay(&self) -> u32 {
+    pub const fn nodelay(&self) -> u32 {
         self.nodelay
     }
-    pub fn updated(&self) -> bool {
+    pub const fn updated(&self) -> bool {
         self.updated
     }
 
-    pub fn ts_probe(&self) -> u32 {
+    pub const fn ts_probe(&self) -> u32 {
         self.ts_probe
     }
-    pub fn probe_wait(&self) -> u32 {
+    pub const fn probe_wait(&self) -> u32 {
         self.probe_wait
     }
 
-    pub fn dead_link(&self) -> u32 {
+    pub const fn dead_link(&self) -> u32 {
         self.dead_link
     }
-    pub fn incr(&self) -> u32 {
+    pub const fn incr(&self) -> u32 {
         self.incr
     }
 
-    pub fn snd_queue(&self) -> &VecDeque<IKCPSEG> {
+    pub const fn snd_queue(&self) -> &VecDeque<IKCPSEG> {
         &self.snd_queue
     }
-    pub fn rcv_queue(&self) -> &VecDeque<IKCPSEG> {
+    pub const fn rcv_queue(&self) -> &VecDeque<IKCPSEG> {
         &self.rcv_queue
     }
-    pub fn snd_buf(&self) -> &VecDeque<IKCPSEG> {
+    pub const fn snd_buf(&self) -> &VecDeque<IKCPSEG> {
         &self.snd_buf
     }
-    pub fn rcv_buf(&self) -> &VecDeque<IKCPSEG> {
+    pub const fn rcv_buf(&self) -> &VecDeque<IKCPSEG> {
         &self.rcv_buf
     }
-    pub fn acklist(&self) -> &Vec<(u32, u32)> {
+    pub const fn acklist(&self) -> &Vec<(u32, u32)> {
         &self.acklist
     }
-    pub fn fastresend(&self) -> i32 {
+    pub const fn fastresend(&self) -> i32 {
         self.fastresend
     }
-    pub fn fastlimit(&self) -> i32 {
+    pub const fn fastlimit(&self) -> i32 {
         self.fastlimit
     }
 
-    pub fn nocwnd(&self) -> bool {
+    pub const fn nocwnd(&self) -> bool {
         self.nocwnd
     }
-    pub fn stream(&self) -> bool {
+    pub const fn stream(&self) -> bool {
         self.stream
     }
 }
