@@ -89,42 +89,21 @@ pub(crate) fn ikcp_segment_new(size: i32) -> IKCPSEG {
     }
 }
 
-// write log
-pub(crate) fn ikcp_log<W>(kcp: &mut IKCPCB, log: String, writelog: &mut W)
-where
-    W: FnMut(&mut IKCPCB, String),
-{
-    (*writelog)(kcp, log)
-}
-
-// check log mask
-pub(crate) fn ikcp_canlog(kcp: &IKCPCB, mask: i32) -> bool {
-    (mask & kcp.logmask) != 0
-}
-
 // output segment
-pub(crate) fn ikcp_output<T, F, W>(
-    kcp: &mut IKCPCB,
+pub(crate) fn ikcp_output<T, F>(
+    kcp: &IKCPCB,
     size: i32,
-    buffer: &mut [u8],
-    destination: &mut [u8],
+    data: &mut [u8],
     user: &mut T,
     output: &mut F,
-    writelog: &mut W,
 ) where
-    F: FnMut(&mut IKCPCB, &mut [u8], &mut [u8], i32, &mut T),
-    W: FnMut(&mut IKCPCB, String),
+    F: FnMut(&mut [u8], i32, &IKCPCB, &mut T),
 {
-    if ikcp_canlog(kcp, IKCP_LOG_OUTPUT as i32) {
-        let log = format!("[RO] {0} bytes", size);
-        ikcp_log(kcp, log, writelog);
-    }
-
     if size == 0 {
         return;
     }
 
-    (*output)(kcp, buffer, destination, size, user);
+    (*output)(data, size, kcp, user);
 }
 
 // create a new kcp control object, 'conv' must equal in two endpoint
@@ -166,20 +145,11 @@ pub fn ikcp_create(conv: u32) -> IKCPCB {
         nocwnd: false,
         xmit: 0,
         dead_link: IKCP_DEADLINK,
-        logmask: 0,
     }
 }
 
 // user/upper level recv: returns size, returns below zero for EAGAIN
-pub fn ikcp_recv<W>(
-    kcp: &mut IKCPCB,
-    mut buffer: Option<&mut [u8]>,
-    mut len: i32,
-    writelog: &mut W,
-) -> i32
-where
-    W: FnMut(&mut IKCPCB, String),
-{
+pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) -> i32 {
     let ispeek = len < 0;
     let peeksize: i32;
     let mut recover = false;
@@ -188,18 +158,14 @@ where
         return -1;
     }
 
-    if len < 0 {
-        len = -len;
-    }
+    len = len.abs();
 
     peeksize = ikcp_peeksize(kcp);
 
-    if peeksize < 0 {
-        return -2;
-    }
-
-    if peeksize > len {
-        return -3;
+    match peeksize {
+        x if x < 0 => return -2,
+        x if x > len => return -3,
+        _ => {}
     }
 
     if (kcp.rcv_queue.len() as u32) >= kcp.rcv_wnd {
@@ -211,18 +177,13 @@ where
     while let Some(seg) = kcp.rcv_queue.front() {
         let fragment: i32;
 
-        if let Some(buf) = buffer {
-            memcpy(buf, &seg.data, seg.data.len());
-            buffer = Some(&mut buf[..seg.data.len()]);
+        if let Some(data) = buffer {
+            memcpy(data, &seg.data, seg.data.len());
+            buffer = Some(&mut data[..seg.data.len()]);
         }
 
         len += seg.data.len() as i32;
         fragment = seg.frg as i32;
-
-        if ikcp_canlog(kcp, IKCP_LOG_RECV as i32) {
-            let log = format!("recv sn = {0}", seg.sn as u64);
-            ikcp_log(kcp, log, writelog);
-        }
 
         if !ispeek {
             kcp.rcv_queue.pop_front();
@@ -233,13 +194,11 @@ where
         }
     }
 
-    assert_eq!(len, peeksize);
-
     // move available data from rcv_buf -> rcv_queue
     while let Some(seg) = kcp.rcv_buf.front() {
         if seg.sn == kcp.rcv_nxt && (kcp.rcv_queue.len() as u32) < kcp.rcv_wnd {
-            let removed_seg = kcp.rcv_buf.pop_front().unwrap();
-            kcp.rcv_queue.push_back(removed_seg);
+            let x = kcp.rcv_buf.pop_front().unwrap();
+            kcp.rcv_queue.push_back(x);
             kcp.rcv_nxt += 1;
         } else {
             break;
@@ -261,7 +220,7 @@ pub fn ikcp_peeksize(kcp: &IKCPCB) -> i32 {
     let mut length = 0;
 
     let seg = match kcp.rcv_queue.front() {
-        Some(front_seg) => front_seg,
+        Some(x) => x,
         None => return -1,
     };
 
@@ -289,8 +248,6 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
     let mut sent = 0;
 
-    assert!(kcp.mss > 0);
-
     if len < 0 {
         return -1;
     }
@@ -299,15 +256,15 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
     if kcp.stream {
         if let Some(old) = kcp.snd_queue.back() {
             if (old.data.len() as u32) < kcp.mss {
-                let capacity: i32 = (kcp.mss - old.data.len() as u32) as i32;
+                let capacity = (kcp.mss - (old.data.len() as u32)) as i32;
                 let extend = len.min(capacity);
-                let mut seg = ikcp_segment_new((old.data.len() as i64 + extend as i64) as i32);
+                let mut seg = ikcp_segment_new(((old.data.len() as i64) + (extend as i64)) as i32);
 
                 memcpy(&mut seg.data, &old.data, old.data.len());
 
-                if let Some(buf) = buffer {
-                    memcpy(&mut seg.data[old.data.len()..], &buf, extend as usize);
-                    buffer = Some(&mut buf[extend as usize..]);
+                if let Some(data) = buffer {
+                    memcpy(&mut seg.data[old.data.len()..], &data, extend as usize);
+                    buffer = Some(&mut data[extend as usize..]);
                 }
 
                 seg.frg = 0;
@@ -323,17 +280,12 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
         }
     }
 
-    if len <= kcp.mss as i32 {
-        count = 1;
-    } else {
-        count = (((len as i64) + (kcp.mss as i64) - 1) / (kcp.mss as i64)) as i32;
-    }
+    count = match len <= (kcp.mss as i32) {
+        true => 1,
+        false => (((len as i64) + (kcp.mss as i64) - 1) / (kcp.mss as i64)) as i32,
+    };
 
-    if !kcp.stream && count > 255 {
-        return -2;
-    }
-
-    if count >= kcp.rcv_wnd as i32 {
+    if count >= (kcp.rcv_wnd as i32).min(255) {
         if kcp.stream && sent > 0 {
             return sent;
         }
@@ -351,18 +303,17 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
         let mut seg = ikcp_segment_new(size);
 
-        if let Some(buf) = buffer {
+        if let Some(data) = buffer {
             if size > 0 {
-                memcpy(&mut seg.data, buf, size as usize);
+                memcpy(&mut seg.data, data, size as usize);
             }
 
-            buffer = Some(&mut buf[..size as usize]);
+            buffer = Some(&mut data[..size as usize]);
         }
 
-        seg.frg = if !kcp.stream {
-            (count - i - 1) as u32
-        } else {
-            0
+        seg.frg = match !kcp.stream {
+            true => (count - i - 1) as u32,
+            false => 0,
         };
 
         kcp.snd_queue.push_back(seg);
@@ -381,9 +332,9 @@ pub(crate) fn ikcp_update_ack(kcp: &mut IKCPCB, rtt: i32) {
         kcp.rx_srtt = rtt;
         kcp.rx_rttval = rtt / 2;
     } else {
-        let mut delta: i64 = (rtt - kcp.rx_srtt) as i64;
+        let mut delta = (rtt - kcp.rx_srtt) as i64;
         delta = delta.abs();
-        kcp.rx_rttval = ((3 * kcp.rx_rttval as i64 + delta) / 4) as i32;
+        kcp.rx_rttval = ((((3 * kcp.rx_rttval) as i64) + delta) / 4) as i32;
         kcp.rx_srtt = (7 * kcp.rx_srtt + rtt) / 8;
         kcp.rx_srtt = kcp.rx_srtt.max(1);
     }
@@ -393,10 +344,9 @@ pub(crate) fn ikcp_update_ack(kcp: &mut IKCPCB, rtt: i32) {
 }
 
 pub(crate) fn ikcp_shrink_buf(kcp: &mut IKCPCB) {
-    if let Some(seg) = kcp.snd_buf.front() {
-        kcp.snd_una = seg.sn;
-    } else {
-        kcp.snd_una = kcp.snd_nxt;
+    kcp.snd_una = match kcp.snd_buf.front() {
+        Some(seg) => seg.sn,
+        None => kcp.snd_nxt,
     }
 }
 
@@ -405,8 +355,7 @@ pub(crate) fn ikcp_parse_ack(kcp: &mut IKCPCB, sn: u32) {
         return;
     }
 
-    for i in 0..kcp.snd_buf.len() {
-        let seg = &kcp.snd_buf[i];
+    for (i, seg) in kcp.snd_buf.iter().enumerate() {
         if sn == seg.sn {
             kcp.snd_buf.remove(i);
             break;
@@ -419,13 +368,14 @@ pub(crate) fn ikcp_parse_ack(kcp: &mut IKCPCB, sn: u32) {
 }
 
 pub(crate) fn ikcp_parse_una(kcp: &mut IKCPCB, una: u32) {
-    if let Some(index) = kcp
-        .snd_buf
-        .iter()
-        .position(|seg| ikcp_timediff(una, seg.sn) <= 0)
-    {
-        kcp.snd_buf.drain(0..index);
+    for (i, seg) in kcp.snd_buf.iter().enumerate() {
+        if ikcp_timediff(una, seg.sn) <= 0 {
+            kcp.snd_buf.drain(0..i);
+            return;
+        }
     }
+
+    kcp.snd_buf.clear();
 }
 
 pub(crate) fn ikcp_parse_fastack(kcp: &mut IKCPCB, sn: u32, ts: u32) {
@@ -458,12 +408,11 @@ pub(crate) fn ikcp_parse_data(kcp: &mut IKCPCB, newseg: IKCPSEG) {
     let sn = newseg.sn;
     let mut repeat = false;
 
-    let mut index = kcp.rcv_buf.len();
-
     if ikcp_timediff(sn, kcp.rcv_nxt + kcp.rcv_wnd) >= 0 || ikcp_timediff(sn, kcp.rcv_nxt) < 0 {
         return;
     }
 
+    let mut index = kcp.rcv_buf.len();
     for (i, seg) in kcp.rcv_buf.iter().enumerate().rev() {
         if seg.sn == sn {
             repeat = true;
@@ -482,9 +431,9 @@ pub(crate) fn ikcp_parse_data(kcp: &mut IKCPCB, newseg: IKCPSEG) {
 
     // move available data from rcv_buf -> rcv_queue
     while let Some(seg) = kcp.rcv_buf.front() {
-        if seg.sn == kcp.rcv_nxt && ((kcp.rcv_queue.len() as u32) < kcp.rcv_wnd) {
-            let removed_seg = kcp.rcv_buf.pop_front().unwrap();
-            kcp.rcv_queue.push_back(removed_seg);
+        if seg.sn == kcp.rcv_nxt && (kcp.rcv_queue.len() as u32) < kcp.rcv_wnd {
+            let x = kcp.rcv_buf.pop_front().unwrap();
+            kcp.rcv_queue.push_back(x);
             kcp.rcv_nxt += 1;
         } else {
             break;
@@ -493,21 +442,13 @@ pub(crate) fn ikcp_parse_data(kcp: &mut IKCPCB, newseg: IKCPSEG) {
 }
 
 // when you received a low level packet (for example. UDP packet), call it
-pub fn ikcp_input<W>(kcp: &mut IKCPCB, mut data: &[u8], mut size: i64, writelog: &mut W) -> i32
-where
-    W: FnMut(&mut IKCPCB, String),
-{
+pub fn ikcp_input(kcp: &mut IKCPCB, mut data: &[u8], mut size: i64) -> i32 {
     let prev_una = kcp.snd_una;
 
     let mut maxack: u32 = 0;
     let mut latest_ts: u32 = 0;
 
     let mut flag = false;
-
-    if ikcp_canlog(kcp, IKCP_LOG_INPUT as i32) {
-        let log = format!("[RI] {0} bytes", size as i32);
-        ikcp_log(kcp, log, writelog);
-    }
 
     if size < (IKCP_OVERHEAD as i64) {
         return -1;
@@ -577,25 +518,9 @@ where
                     maxack = sn;
                     latest_ts = ts;
                 }
-
-                if ikcp_canlog(kcp, IKCP_LOG_IN_ACK as i32) {
-                    let log = format!(
-                        "input ack: sn = {0}, rtt = {1}, rto = {2}",
-                        sn as u64,
-                        ikcp_timediff(kcp.current, ts) as i64,
-                        kcp.rx_rto as i64
-                    );
-
-                    ikcp_log(kcp, log, writelog);
-                }
             }
 
             IKCP_CMD_PUSH => {
-                if ikcp_canlog(kcp, IKCP_LOG_IN_DATA as i32) {
-                    let log = format!("input psh: sn = {0}, ts = {1}", sn as u64, ts as u64);
-                    ikcp_log(kcp, log, writelog);
-                }
-
                 if ikcp_timediff(sn, kcp.rcv_nxt + kcp.rcv_wnd) < 0 {
                     ikcp_ack_push(kcp, sn, ts);
                     if ikcp_timediff(sn, kcp.rcv_nxt) >= 0 {
@@ -621,19 +546,10 @@ where
                 // ready to send back IKCP_CMD_WINS in ikcp_flush
                 // tell remote my window size
                 kcp.probe |= IKCP_ASK_TELL;
-
-                if ikcp_canlog(kcp, IKCP_LOG_IN_PROBE as i32) {
-                    let log = "input probe".to_string();
-                    ikcp_log(kcp, log, writelog);
-                }
             }
 
             IKCP_CMD_WINS => {
                 // do nothing
-                if ikcp_canlog(kcp, IKCP_LOG_IN_WINS as i32) {
-                    let log = format!("input wins: {0}", wnd as u64);
-                    ikcp_log(kcp, log, writelog);
-                }
             }
 
             _ => return -3,
@@ -656,11 +572,7 @@ where
             kcp.incr = kcp.incr.max(mss);
             kcp.incr += (mss * mss) / kcp.incr + (mss / 16);
             if (kcp.cwnd + 1) * mss <= kcp.incr {
-                kcp.cwnd = (kcp.incr + mss - 1)
-                    / (match mss > 0 {
-                        true => mss,
-                        false => 1,
-                    });
+                kcp.cwnd = (kcp.incr + mss - 1) / mss.max(1);
             }
         }
 
@@ -691,16 +603,9 @@ pub(crate) fn ikcp_wnd_unused(kcp: &IKCPCB) -> i32 {
 }
 
 // flush pending data
-pub fn ikcp_flush<T, F, W>(
-    kcp: &mut IKCPCB,
-    buffer: &mut [u8],
-    destination: &mut [u8],
-    user: &mut T,
-    output: &mut F,
-    writelog: &mut W,
-) where
-    F: FnMut(&mut IKCPCB, &mut [u8], &mut [u8], i32, &mut T),
-    W: FnMut(&mut IKCPCB, String),
+pub fn ikcp_flush<T, F>(kcp: &mut IKCPCB, buffer: &mut [u8], user: &mut T, output: &mut F)
+where
+    F: FnMut(&mut [u8], i32, &IKCPCB, &mut T),
 {
     let current = kcp.current;
     let position = buffer.as_ptr() as usize;
@@ -742,7 +647,7 @@ pub fn ikcp_flush<T, F, W>(
     for i in 0..(kcp.acklist.len() as i32) {
         size = memoffset(ptr, position) as i32;
         if size + (IKCP_OVERHEAD as i32) > (kcp.mtu as i32) {
-            ikcp_output(kcp, size, buffer, destination, user, output, writelog);
+            ikcp_output(kcp, size, buffer, user, output);
             ptr = &mut *buffer;
         }
 
@@ -774,7 +679,7 @@ pub fn ikcp_flush<T, F, W>(
         seg.cmd = IKCP_CMD_WASK as u32;
         size = memoffset(ptr, position) as i32;
         if size + (IKCP_OVERHEAD as i32) > (kcp.mtu as i32) {
-            ikcp_output(kcp, size, buffer, destination, user, output, writelog);
+            ikcp_output(kcp, size, buffer, user, output);
             ptr = &mut *buffer;
         }
 
@@ -786,7 +691,7 @@ pub fn ikcp_flush<T, F, W>(
         seg.cmd = IKCP_CMD_WINS as u32;
         size = memoffset(ptr, position) as i32;
         if size + (IKCP_OVERHEAD as i32) > (kcp.mtu as i32) {
-            ikcp_output(kcp, size, buffer, destination, user, output, writelog);
+            ikcp_output(kcp, size, buffer, user, output);
             ptr = &mut *buffer;
         }
 
@@ -859,7 +764,7 @@ pub fn ikcp_flush<T, F, W>(
             segment.resendts = current + segment.rto;
             lost = true;
         } else if segment.fastack >= resent
-            && (segment.xmit <= kcp.fastlimit as u32 || kcp.fastlimit <= 0)
+            && (segment.xmit <= (kcp.fastlimit as u32) || kcp.fastlimit <= 0)
         {
             needsend = true;
             segment.xmit += 1;
@@ -875,15 +780,12 @@ pub fn ikcp_flush<T, F, W>(
             segment.una = kcp.rcv_nxt;
 
             size = memoffset(ptr, position) as i32;
-            need = (IKCP_OVERHEAD as i32) + segment.data.len() as i32;
+            need = (IKCP_OVERHEAD as i32) + (segment.data.len() as i32);
 
             if (size + need) > (kcp.mtu as i32) {
-                let len = kcp.snd_buf.len();
-
-                ikcp_output(kcp, size, buffer, destination, user, output, writelog);
+                ikcp_output(kcp, size, buffer, user, output);
                 ptr = &mut *buffer;
 
-                assert_eq!(len, kcp.snd_buf.len());
                 segment = &mut kcp.snd_buf[i];
             }
 
@@ -903,7 +805,7 @@ pub fn ikcp_flush<T, F, W>(
     // flash remain segments
     size = memoffset(ptr, position) as i32;
     if size > 0 {
-        ikcp_output(kcp, size, buffer, destination, user, output, writelog);
+        ikcp_output(kcp, size, buffer, user, output);
     }
 
     // update ssthresh
@@ -931,17 +833,14 @@ pub fn ikcp_flush<T, F, W>(
 // update state (call it repeatedly, every 10ms-100ms), or you can ask
 // ikcp_check when to call it again (without ikcp_input/_send calling).
 // 'current' - current timestamp in millisec.
-pub fn ikcp_update<T, F, W>(
+pub fn ikcp_update<T, F>(
     kcp: &mut IKCPCB,
     current: u32,
     buffer: &mut [u8],
-    destination: &mut [u8],
     user: &mut T,
     output: &mut F,
-    writelog: &mut W,
 ) where
-    F: FnMut(&mut IKCPCB, &mut [u8], &mut [u8], i32, &mut T),
-    W: FnMut(&mut IKCPCB, String),
+    F: FnMut(&mut [u8], i32, &IKCPCB, &mut T),
 {
     let mut slap: i32;
 
@@ -965,7 +864,7 @@ pub fn ikcp_update<T, F, W>(
             kcp.ts_flush = kcp.current + kcp.interval;
         }
 
-        ikcp_flush(kcp, buffer, destination, user, output, writelog);
+        ikcp_flush(kcp, buffer, user, output);
     }
 }
 
@@ -1079,10 +978,6 @@ pub fn ikcp_stream(kcp: &mut IKCPCB, stream: bool) {
     kcp.stream = stream
 }
 
-pub fn ikcp_logmask(kcp: &mut IKCPCB, logmask: i32) {
-    kcp.logmask = logmask
-}
-
 pub struct IKCPSEG {
     pub(crate) conv: u32,
     pub(crate) cmd: u32,
@@ -1184,8 +1079,6 @@ pub struct IKCPCB {
 
     pub(crate) nocwnd: bool,
     pub(crate) stream: bool,
-
-    pub(crate) logmask: i32,
 }
 
 impl IKCPCB {
@@ -1307,21 +1200,4 @@ impl IKCPCB {
     pub fn stream(&self) -> bool {
         self.stream
     }
-
-    pub fn logmask(&self) -> i32 {
-        self.logmask
-    }
 }
-
-pub const IKCP_LOG_OUTPUT: u32 = 1;
-pub const IKCP_LOG_INPUT: u32 = 2;
-pub const IKCP_LOG_SEND: u32 = 4;
-pub const IKCP_LOG_RECV: u32 = 8;
-pub const IKCP_LOG_IN_DATA: u32 = 16;
-pub const IKCP_LOG_IN_ACK: u32 = 32;
-pub const IKCP_LOG_IN_PROBE: u32 = 64;
-pub const IKCP_LOG_IN_WINS: u32 = 128;
-pub const IKCP_LOG_OUT_DATA: u32 = 256;
-pub const IKCP_LOG_OUT_ACK: u32 = 512;
-pub const IKCP_LOG_OUT_PROBE: u32 = 1024;
-pub const IKCP_LOG_OUT_WINS: u32 = 2048;
