@@ -1,5 +1,4 @@
-﻿use kcp_rust::c::kcp;
-use kcp_rust::h::kcp::IKCPCB;
+﻿use kcp_rust::kcp::*;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -31,9 +30,9 @@ fn kcp_server(addr: SocketAddr) {
 
     socket.lock().unwrap().set_nonblocking(true).unwrap();
 
-    let mut kcp = kcp::ikcp_create(114514);
-    kcp.interval = 10;
-    kcp.nodelay = 1;
+    let mut kcp = ikcp_create(114514);
+
+    ikcp_nodelay(&mut kcp, 1, 10, 1, true);
 
     let mut buffer = vec![0u8; 1500];
 
@@ -45,11 +44,19 @@ fn kcp_server(addr: SocketAddr) {
 
     let mut remote_addr: Option<SocketAddr> = None;
 
+    let mut writelog_closure: fn(&mut IKCPCB, String) = |_: &mut IKCPCB, _: String| {};
+
     loop {
         match socket.lock().unwrap().recv_from(&mut recv_buf) {
             Ok((size, src)) => {
                 remote_addr = Some(src);
-                kcp::ikcp_input(&mut kcp, &recv_buf[..size], size as i64);
+
+                ikcp_input(
+                    &mut kcp,
+                    &recv_buf[..size],
+                    size as i64,
+                    &mut writelog_closure,
+                );
             }
 
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
@@ -62,14 +69,15 @@ fn kcp_server(addr: SocketAddr) {
         let current = start_time.elapsed().as_millis() as u32;
         if last_update.elapsed() >= Duration::from_millis(10) {
             if remote_addr.is_some() {
-                let mut output_closure = |_: &IKCPCB, buf: &mut [u8], _: &mut [u8], len: i32| {
-                    if len > 0 {
-                        let socket = socket.lock().unwrap();
-                        socket
-                            .send_to(&buf[..len as usize], remote_addr.unwrap())
-                            .unwrap();
-                    }
-                };
+                let mut output_closure =
+                    |_: &mut IKCPCB, buf: &mut [u8], _: &mut [u8], len: i32, _: &mut ()| {
+                        if len > 0 {
+                            let socket = socket.lock().unwrap();
+                            socket
+                                .send_to(&buf[..len as usize], remote_addr.unwrap())
+                                .unwrap();
+                        }
+                    };
 
                 unsafe {
                     let buffer_len = buffer.len();
@@ -77,12 +85,15 @@ fn kcp_server(addr: SocketAddr) {
 
                     let mut buffer1 = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
                     let mut buffer2 = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
-                    kcp::ikcp_update(
+
+                    ikcp_update(
                         &mut kcp,
                         current,
                         &mut buffer1,
                         &mut buffer2,
+                        &mut (),
                         &mut output_closure,
+                        &mut writelog_closure,
                     );
                 }
             }
@@ -91,7 +102,12 @@ fn kcp_server(addr: SocketAddr) {
         }
 
         let mut recv_buffer = [0u8; 1024];
-        let size = kcp::ikcp_recv(&mut kcp, Some(&mut recv_buffer), 1024);
+        let size = ikcp_recv(
+            &mut kcp,
+            Some(&mut recv_buffer),
+            1024,
+            &mut writelog_closure,
+        );
         if size > 0 {
             let msg = String::from_utf8_lossy(&recv_buffer[..size as usize]);
             println!("[Server] Received: {}", msg);
@@ -100,7 +116,7 @@ fn kcp_server(addr: SocketAddr) {
             let mut data = echo_msg.as_bytes().to_vec();
 
             let len = data.len();
-            let result = kcp::ikcp_send(&mut kcp, Some(&mut data), len as i32);
+            let result = ikcp_send(&mut kcp, Some(&mut data), len as i32);
             println!("[Server] Echoed: {} (result: {})", echo_msg, result);
         } else if size != -1 {
             println!("[Server] Received Error: {}", size);
@@ -118,9 +134,8 @@ fn kcp_client(addr: SocketAddr, server_addr: SocketAddr) {
     socket.lock().unwrap().connect(server_addr).unwrap();
     socket.lock().unwrap().set_nonblocking(true).unwrap();
 
-    let mut kcp = kcp::ikcp_create(114514);
-    kcp.interval = 10;
-    kcp.nodelay = 1;
+    let mut kcp = ikcp_create(114514);
+    ikcp_nodelay(&mut kcp, 1, 10, 1, true);
 
     let mut buffer = vec![0u8; 1500];
     let mut recv_buf = vec![0u8; 1500];
@@ -130,11 +145,19 @@ fn kcp_client(addr: SocketAddr, server_addr: SocketAddr) {
     let mut sequence = 0;
 
     println!("[Client] Connecting to {}", server_addr);
+    let mut user = 0;
+
+    let mut writelog_closure: fn(&mut IKCPCB, String) = |_: &mut IKCPCB, _: String| {};
 
     loop {
         match socket.lock().unwrap().recv(&mut recv_buf) {
             Ok(size) => {
-                kcp::ikcp_input(&mut kcp, &recv_buf[..size], size as i64);
+                ikcp_input(
+                    &mut kcp,
+                    &recv_buf[..size],
+                    size as i64,
+                    &mut writelog_closure,
+                );
             }
 
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
@@ -146,12 +169,16 @@ fn kcp_client(addr: SocketAddr, server_addr: SocketAddr) {
 
         let current = start_time.elapsed().as_millis() as u32;
         if last_update.elapsed() >= Duration::from_millis(10) {
-            let mut output_closure = |kcp: &IKCPCB, buf: &mut [u8], _: &mut [u8], len: i32| {
-                if len > 0 {
-                    let socket = socket.lock().unwrap();
-                    socket.send_to(&buf[..len as usize], server_addr).unwrap();
-                }
-            };
+            let mut output_closure =
+                |_: &mut IKCPCB, buf: &mut [u8], _: &mut [u8], len: i32, a: &mut i32| {
+                    if len > 0 {
+                        *a += 1;
+                        // println!("[Client] Test: {}", *s);
+
+                        let socket = socket.lock().unwrap();
+                        socket.send_to(&buf[..len as usize], server_addr).unwrap();
+                    }
+                };
 
             unsafe {
                 let buffer_len = buffer.len();
@@ -159,12 +186,15 @@ fn kcp_client(addr: SocketAddr, server_addr: SocketAddr) {
 
                 let mut buffer1 = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
                 let mut buffer2 = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
-                kcp::ikcp_update(
+
+                ikcp_update(
                     &mut kcp,
                     current,
                     &mut buffer1,
                     &mut buffer2,
+                    &mut user,
                     &mut output_closure,
+                    &mut writelog_closure,
                 );
             }
 
@@ -176,13 +206,18 @@ fn kcp_client(addr: SocketAddr, server_addr: SocketAddr) {
             let msg = format!("Hello KCP! {}", sequence);
             let mut data = msg.as_bytes().to_vec();
             let len = data.len() as i32;
-            kcp::ikcp_send(&mut kcp, Some(&mut data), len);
+            ikcp_send(&mut kcp, Some(&mut data), len);
 
             last_send = Instant::now();
         }
 
         let mut recv_buffer = [0u8; 1024];
-        let size = kcp::ikcp_recv(&mut kcp, Some(&mut recv_buffer), 1024);
+        let size = ikcp_recv(
+            &mut kcp,
+            Some(&mut recv_buffer),
+            1024,
+            &mut writelog_closure,
+        );
         if size > 0 {
             let msg = String::from_utf8_lossy(&recv_buffer[..size as usize]);
             println!("[Client] Received: {}", msg);
