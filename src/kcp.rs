@@ -23,11 +23,11 @@ pub const IKCP_PROBE_INIT: u32 = 7000; // 7 secs to probe window size
 pub const IKCP_PROBE_LIMIT: u32 = 120000; // up to 120 secs to probe window
 pub const IKCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
 
-pub(crate) fn memcpy(dst: &mut [u8], src: &[u8], len: usize) {
+pub(crate) fn ikcp_memcpy(dst: &mut [u8], src: &[u8], len: usize) {
     dst[..len].copy_from_slice(&src[..len]);
 }
 
-pub(crate) fn memoffset(dst: &[u8], src: usize) -> usize {
+pub(crate) fn ikcp_memoffset(dst: &[u8], src: usize) -> usize {
     (dst.as_ptr() as usize) - src
 }
 
@@ -45,7 +45,7 @@ pub fn ikcp_decode8u<'a>(p: &'a [u8], c: &mut u8) -> &'a [u8] {
 
 // encode 16 bits unsigned int (lsb)
 pub fn ikcp_encode16u(p: &mut [u8], w: u16) -> &mut [u8] {
-    memcpy(p, &w.to_le_bytes(), 2);
+    ikcp_memcpy(p, &w.to_le_bytes(), 2);
     &mut p[2..]
 }
 
@@ -57,7 +57,7 @@ pub fn ikcp_decode16u<'a>(p: &'a [u8], w: &mut u16) -> &'a [u8] {
 
 // encode 32 bits unsigned int (lsb)
 pub fn ikcp_encode32u(p: &mut [u8], l: u32) -> &mut [u8] {
-    memcpy(p, &l.to_le_bytes(), 4);
+    ikcp_memcpy(p, &l.to_le_bytes(), 4);
     &mut p[4..]
 }
 
@@ -178,7 +178,7 @@ pub fn ikcp_recv(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
         let fragment: i32;
 
         if let Some(data) = buffer {
-            memcpy(data, &seg.data, seg.data.len());
+            ikcp_memcpy(data, &seg.data, seg.data.len());
             buffer = Some(&mut data[..seg.data.len()]);
         }
 
@@ -260,10 +260,10 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
                 let extend = len.min(capacity);
                 let mut seg = ikcp_segment_new(((old.data.len() as i64) + (extend as i64)) as i32);
 
-                memcpy(&mut seg.data, &old.data, old.data.len());
+                ikcp_memcpy(&mut seg.data, &old.data, old.data.len());
 
                 if let Some(data) = buffer {
-                    memcpy(&mut seg.data[old.data.len()..], data, extend as usize);
+                    ikcp_memcpy(&mut seg.data[old.data.len()..], data, extend as usize);
                     buffer = Some(&mut data[extend as usize..]);
                 }
 
@@ -305,7 +305,7 @@ pub fn ikcp_send(kcp: &mut IKCPCB, mut buffer: Option<&mut [u8]>, mut len: i32) 
 
         if let Some(data) = buffer {
             if size > 0 {
-                memcpy(&mut seg.data, data, size as usize);
+                ikcp_memcpy(&mut seg.data, data, size as usize);
             }
 
             buffer = Some(&mut data[..size as usize]);
@@ -534,7 +534,7 @@ pub fn ikcp_input(kcp: &mut IKCPCB, mut data: &[u8], mut size: i64) -> i32 {
                         seg.una = una;
 
                         if len > 0 {
-                            memcpy(&mut seg.data, data, len as usize);
+                            ikcp_memcpy(&mut seg.data, data, len as usize);
                         }
 
                         ikcp_parse_data(kcp, seg);
@@ -645,7 +645,7 @@ where
 
     // flush acknowledges
     for i in 0..(kcp.acklist.len() as i32) {
-        size = memoffset(ptr, position) as i32;
+        size = ikcp_memoffset(ptr, position) as i32;
         if size + (IKCP_OVERHEAD as i32) > (kcp.mtu as i32) {
             ikcp_output(kcp, size, buffer, user, output);
             ptr = &mut *buffer;
@@ -677,7 +677,7 @@ where
     // flush window probing commands
     if (kcp.probe & IKCP_ASK_SEND) != 0 {
         seg.cmd = IKCP_CMD_WASK as u32;
-        size = memoffset(ptr, position) as i32;
+        size = ikcp_memoffset(ptr, position) as i32;
         if size + (IKCP_OVERHEAD as i32) > (kcp.mtu as i32) {
             ikcp_output(kcp, size, buffer, user, output);
             ptr = &mut *buffer;
@@ -689,7 +689,7 @@ where
     // flush window probing commands
     if (kcp.probe & IKCP_ASK_TELL) != 0 {
         seg.cmd = IKCP_CMD_WINS as u32;
-        size = memoffset(ptr, position) as i32;
+        size = ikcp_memoffset(ptr, position) as i32;
         if size + (IKCP_OVERHEAD as i32) > (kcp.mtu as i32) {
             ikcp_output(kcp, size, buffer, user, output);
             ptr = &mut *buffer;
@@ -779,7 +779,7 @@ where
             segment.wnd = seg.wnd;
             segment.una = kcp.rcv_nxt;
 
-            size = memoffset(ptr, position) as i32;
+            size = ikcp_memoffset(ptr, position) as i32;
             need = (IKCP_OVERHEAD as i32) + (segment.data.len() as i32);
 
             if (size + need) > (kcp.mtu as i32) {
@@ -792,7 +792,7 @@ where
             ptr = ikcp_encode_seg(ptr, segment);
 
             if !segment.data.is_empty() {
-                memcpy(ptr, &segment.data, segment.data.len());
+                ikcp_memcpy(ptr, &segment.data, segment.data.len());
                 ptr = &mut ptr[segment.data.len()..];
             }
 
@@ -803,7 +803,7 @@ where
     }
 
     // flash remain segments
-    size = memoffset(ptr, position) as i32;
+    size = ikcp_memoffset(ptr, position) as i32;
     if size > 0 {
         ikcp_output(kcp, size, buffer, user, output);
     }
@@ -918,9 +918,11 @@ pub fn ikcp_setmtu(kcp: &mut IKCPCB, mtu: i32) -> bool {
     true
 }
 
-pub(crate) fn ikcp_interval(kcp: &mut IKCPCB, mut interval: i32) {
-    interval = interval.clamp(10, 5000);
-    kcp.interval = interval as u32;
+pub fn ikcp_interval(kcp: &mut IKCPCB, mut interval: i32) {
+    if interval >= 0 {
+        interval = interval.clamp(10, 5000);
+        kcp.interval = interval as u32;
+    }
 }
 
 // fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
@@ -937,9 +939,7 @@ pub fn ikcp_nodelay(kcp: &mut IKCPCB, nodelay: i32, interval: i32, resend: i32, 
         };
     }
 
-    if interval >= 0 {
-        ikcp_interval(kcp, interval);
-    }
+    ikcp_interval(kcp, interval);
 
     if resend >= 0 {
         kcp.fastresend = resend;
@@ -968,6 +968,14 @@ pub fn ikcp_waitsnd(kcp: &IKCPCB) -> i32 {
 // read conv
 pub const fn ikcp_getconv(kcp: &IKCPCB) -> u32 {
     kcp.conv
+}
+
+pub fn ikcp_state(kcp: &mut IKCPCB, state: bool) {
+    kcp.state = state;
+}
+
+pub fn ikcp_rx_minrto(kcp: &mut IKCPCB, rx_minrto: i32) {
+    kcp.rx_minrto = rx_minrto.max(1);
 }
 
 pub fn ikcp_dead_link(kcp: &mut IKCPCB, dead_link: u32) {
